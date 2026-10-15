@@ -1,0 +1,50 @@
+{
+  "task_id": "POLARIS-SWE-042",
+  "final_score": 1.0,
+  "integrity_passed": true,
+  "integrity_violations": [],
+  "rubric_breakdown": [
+    {
+      "dimension": "Public Regression Test Suite",
+      "weight": 0.15,
+      "raw_score": 1.0,
+      "weighted_contribution": 0.15,
+      "details": "Passed all public regression tests."
+    },
+    {
+      "dimension": "Diagnostic Fail-to-Pass Reproduction",
+      "weight": 0.15,
+      "raw_score": 1.0,
+      "weighted_contribution": 0.15,
+      "details": "Verified authentic Fail-to-Pass reproduction: failed on baseline, passed on patch."
+    },
+    {
+      "dimension": "Concurrency: 50-Way Idempotency & Conservation",
+      "weight": 0.25,
+      "raw_score": 1.0,
+      "weighted_contribution": 0.25,
+      "details": "Unique txns=1, balances=(7500, 2500), score=1.00"
+    },
+    {
+      "dimension": "Outbox: Poison-Pill Isolation & Atomic Claim",
+      "weight": 0.2,
+      "raw_score": 1.0,
+      "weighted_contribution": 0.2,
+      "details": "All 5 healthy events dispatched exactly once; poison pill isolated."
+    },
+    {
+      "dimension": "Batch Processor: AB-BA Deadlock & Atomic Rollback",
+      "weight": 0.25,
+      "raw_score": 1.0,
+      "weighted_contribution": 0.25,
+      "details": "Deadlock-free execution and atomic rollback verified (score=1.00)."
+    },
+    {
+      "dimension": "Non-Functional: Disjoint Account Parallel Throughput",
+      "weight": 0.15,
+      "raw_score": 1.0,
+      "weighted_contribution": 0.15,
+      "details": "100 disjoint transfers completed in 0.051s (SLA < 0.35s for full credit)."
+    }
+  ]
+}

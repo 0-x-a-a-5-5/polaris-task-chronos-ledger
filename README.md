@@ -1,5 +1,9 @@
 # POLARIS-SWE-042: Chronos High-Concurrency Ledger & Transactional Outbox Benchmark
 
+> [!IMPORTANT]
+> **Live Eval Result (2026-10-15):** Gemini 3.8 Flash, running autonomously in Google's Antigravity CLI 1.3.6 on the verbatim `prompt.md`, scored **1.00 / 1.00** after 13 min 47 s, 54 shell commands, and 18 file edits. All six rubric dimensions passed and the integrity gate found no violations.
+> Its patch takes per-account `asyncio.Lock`s in sorted order in `engine.py` and `batch.py`, claims outbox rows atomically as `IN_FLIGHT` under a mutex in `db.py`, and validates every batch leg in memory before the first write. Diff, grader JSON, and run metadata are in [`trajectories/`](trajectories/).
+
 [![Polaris Grader Verification](https://github.com/0-x-a-a-5-5/polaris-task-chronos-ledger/actions/workflows/polaris-grader.yml/badge.svg)](https://github.com/0-x-a-a-5-5/polaris-task-chronos-ledger/actions/workflows/polaris-grader.yml)
 [![Polaris Task Spec](https://img.shields.io/badge/Polaris_Eval_Spec-v1.0-blue.svg)](#1-benchmark-overview--design-philosophy)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg)](https://www.python.org/)
@@ -105,7 +109,7 @@ docker run --rm -v "/path/to/agent/workspace:/eval/workspace" polaris-chronos-ev
 
 ## 5. Technical Post-Mortem: How Frontier Coding Agents Fail on `POLARIS-SWE-042`
 
-When frontier LLM coding agents attempt `POLARIS-SWE-042`, their trajectories expose four recurring failure archetypes:
+The rubric is built to catch four failure archetypes that recur in agent trajectories on concurrency tasks. The one live trajectory recorded so far (Gemini 3.8 Flash, see the result at the top and [`trajectories/`](trajectories/)) avoided all four, so read these as what the grader checks for rather than as observed behaviour of current frontier models:
 
 1. **Failure Mode 1 — The Coarse Global Lock Trap:** Agents wrap `execute_transfer()` in a single `self._lock = asyncio.Lock()`. This passes single-key race tests but fails Sub-Rubric 6 because 100 disjoint transfers with a 15ms I/O wait serialize to $\ge 1.50\text{s}$ instead of completing concurrently in $\sim 0.03\text{s}$.
 2. **Failure Mode 2 — `AB-BA` Lock-Ordering & Reentrant Self-Deadlocks:** Agents that lock `source_account` then `target_account` deadlock when opposing batches (`X -> Y` and `Y -> X`) run concurrently. Agents that pre-lock all batch accounts using standard `asyncio.Lock` and then call `engine.execute_transfer()` self-deadlock unless they track coroutine-held locks via `contextvars.ContextVar`.
