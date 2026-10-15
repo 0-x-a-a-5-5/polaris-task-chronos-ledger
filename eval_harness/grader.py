@@ -15,6 +15,9 @@ v1.1 (2026-10-15), after a frontier agent saturated v1.0:
     "deadlock-free"; the unpatched baseline scores 0.10 (public suite only).
   * New checks: outbox claim leases survive a hung worker, a transient-backoff
     guard, batch idempotency and orphan-row checks, bounded synchronization state.
+v1.1.1 (2026-10-15): the retry storm also requires exactly one transfer's worth
+    of rows (2 ledger entries, 1 outbox event). Correct balances with duplicated
+    rows would still double-fire webhooks, and a credit/debit sum cannot see it.
 """
 
 import ast
@@ -35,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-RUBRIC_VERSION = "1.1"
+RUBRIC_VERSION = "1.1.1"
 
 WEIGHTS = {
     "public": 0.10,
@@ -299,9 +302,14 @@ async def bench_idempotency(m, nonce: str) -> RubricComponent:
         receipts = await asyncio.gather(*(engine.execute_transfer(req) for _ in range(50)))
         unique_ids = {r.transfer_id for r in receipts}
         alpha_bal, beta_bal = await db.get_balance(alpha), await db.get_balance(beta)
+        ledger_rows, outbox_rows = _count_rows(db, "ledger_entries"), _count_rows(db, "outbox_events")
 
         score = 0.0
-        if len(unique_ids) == 1 and alpha_bal == 7_500 and beta_bal == 2_500:
+        if (
+            len(unique_ids) == 1
+            and (alpha_bal, beta_bal) == (7_500, 2_500)
+            and (ledger_rows, outbox_rows) == (2, 1)
+        ):
             score += 0.70
 
         mutated = m.TransferRequest(f"polaris_storm_key_{nonce}", alpha, beta, 9_999)
@@ -311,7 +319,10 @@ async def bench_idempotency(m, nonce: str) -> RubricComponent:
             score += 0.30
 
         comp.score = score
-        comp.details = f"Unique txns={len(unique_ids)}, balances=({alpha_bal}, {beta_bal}), score={score:.2f}"
+        comp.details = (
+            f"Unique txns={len(unique_ids)}, balances=({alpha_bal}, {beta_bal}), "
+            f"ledger rows={ledger_rows} (want 2), outbox rows={outbox_rows} (want 1), score={score:.2f}"
+        )
     except Exception as exc:
         comp.details = f"Exception during idempotency storm: {exc!r}"
     return comp

@@ -10,7 +10,7 @@ README section 5 makes claims about how coding agents fail on this task. This di
 
 ## Rubric versions
 
-Each score file names the rubric it was produced under (`rubric_version` in the JSON). Attempt 01 ran against the v1.0 prompt and grader and saturated them; rubric v1.1 (same day) added the claim-lease and bounded-state requirements to `prompt.md`, gated non-functional credit on correctness, and re-balanced the weights to sum to 1.00. Attempts from 02 onward ran against the v1.1 prompt. Where a workspace was re-graded under a later rubric, the file carries the rubric suffix (`_score_v1.1.json`).
+Each score file names the rubric it was produced under (`rubric_version` in the JSON). Attempt 01 ran against the v1.0 prompt and grader and saturated them; rubric v1.1 (same day) added the claim-lease and bounded-state requirements to `prompt.md`, gated non-functional credit on correctness, and re-balanced the weights to sum to 1.00. Attempts from 02 onward ran against the v1.1 prompt. Where a workspace was re-graded under a later rubric, the file carries the rubric suffix (`_score_v1.1.json`). Grader 1.1.1 (retry storm also counts rows) re-grades attempts 01, 02 and 03 identically at 0.85, 1.00 and 1.00, so their score files are kept as produced under 1.1.
 
 ## Attempt 01: Gemini 3.8 Flash (high) via Antigravity CLI 1.3.6, 2026-10-15
 
