@@ -19,6 +19,7 @@ When upstream API gateways time out and issue parallel retries for the same `Tra
 `OutboxRelayWorker.run_tick()` polls pending outbox events and dispatches them via an injected async `WebhookTransport`.
 1. **Head-of-Line Poison Pill:** When `WebhookTransport.send()` raises `PermanentWebhookError` (e.g., HTTP 422 schema rejection), the worker fails the entire batch tick, leaving healthy events behind it stuck in `PENDING` status indefinitely. Events raising `PermanentWebhookError` must be immediately transitioned to `DEAD_LETTER` with their error recorded, allowing remaining events in the batch to proceed.
 2. **Transient Backoff vs. Duplicate Send:** When `WebhookTransport.send()` raises `TransientWebhookError` (e.g., HTTP 503), the event's `attempts` counter must increment and transition back to `PENDING` (or `DEAD_LETTER` once `attempts >= max_attempts`). Currently, concurrent worker instances polling `run_tick()` at the same time can pick up and dispatch the same event twice.
+3. **Stuck Claims After Worker Death:** A worker that claims events and then hangs or dies (network black hole, OOM-kill mid-dispatch) must not strand them. Claims carry a lease: `OutboxRelayWorker(db, transport, max_attempts=3, batch_size=20, claim_lease_sec=DEFAULT_OUTBOX_CLAIM_LEASE_SEC)`. An event whose claim has expired is eligible for any worker again; an event whose claim has not expired must never be re-dispatched.
 
 ---
 
@@ -33,8 +34,11 @@ Implement `BatchTransferProcessor.execute_batch(batch_id: str, transfers: list[T
 
 ## Non-Functional & Verification Requirements
 * **Throughput Invariant:** Do **not** serialize the entire engine behind a single coarse global lock. Unrelated transfers (touching disjoint account pairs) must execute concurrently. Our benchmark requires 100 concurrent transfers across disjoint account pairs (with a simulated 15ms I/O delay per transaction) to complete in under **0.35 seconds** wall-clock time for full credit.
+* **Bounded Synchronization State:** Per-key and per-account synchronization objects must be released once no operation is using them. A fixed-size striped pool or a reference-counted registry both qualify; a dictionary that keeps one `asyncio.Lock` per key forever does not. The benchmark runs 5,000 transfers across 10,000 distinct accounts and then requires fewer than 512 live asyncio synchronization primitives and fewer than 5,000 retained Python objects.
 * **Diagnostic Reproduction Suite:** In `tests/test_reproduction.py`, write at least three deterministic async tests that fail against the initial codebase and pass after your fix:
   1. `test_concurrent_idempotency_retry_storm`
   2. `test_outbox_poison_pill_and_concurrent_workers`
   3. `test_concurrent_opposing_batches_atomic_rollback`
-* **Constraint:** Do not modify existing test assertions in `tests/test_public_ledger.py` or change public class/method signatures in `models.py`.
+
+  You may add further tests; the whole file must fail on the initial codebase and pass after your fix.
+* **Constraint:** Do not modify existing test assertions in `tests/test_public_ledger.py` or change public class/method signatures in `models.py`. The grading harness reads `event_id`, `status`, `attempts`, and `last_error` from `outbox_events` through `InMemoryAsyncLedgerDB._conn`; keep that attribute and those columns (adding columns is fine).

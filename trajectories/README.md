@@ -8,6 +8,10 @@ README section 5 makes claims about how coding agents fail on this task. This di
 2. The agent runs in that directory with `prompt.md` passed verbatim as its only prompt, every tool call auto-approved, and a Python 3.11 + pytest environment first on `PATH` (the same Python the grader container uses). The run is bounded at 20 minutes of wall clock.
 3. The agent's working tree is diffed against the baseline (`gemini_attempt_NN.diff`), then mounted unchanged into the evaluation container at `/eval/workspace` and graded (`gemini_attempt_NN_score.json`). `gemini_attempt_NN_meta.json` records agent, model, Python, start time, duration, and exit code.
 
+## Rubric versions
+
+Each score file names the rubric it was produced under (`rubric_version` in the JSON). Attempt 01 ran against the v1.0 prompt and grader and saturated them; rubric v1.1 (same day) added the claim-lease and bounded-state requirements to `prompt.md`, gated non-functional credit on correctness, and re-balanced the weights to sum to 1.00. Attempts from 02 onward ran against the v1.1 prompt. Where a workspace was re-graded under a later rubric, the file carries the rubric suffix (`_score_v1.1.json`).
+
 ## Attempt 01: Gemini 3.8 Flash (high) via Antigravity CLI 1.3.6, 2026-10-15
 
 | | |
@@ -17,6 +21,7 @@ README section 5 makes claims about how coding agents fail on this task. This di
 | Tool calls | 54 shell commands, 40 file views, 18 file edits |
 | Tokens | 657k input, 88k output, 68k thinking, 4.07M cache reads |
 | Files changed | `engine.py`, `db.py`, `outbox.py`, `batch.py`, `tests/test_reproduction.py` |
+| Re-graded under v1.1 | 0.85: lease recovery not implemented (`OutboxRelayWorker` rejects `claim_lease_sec`), and 15,051 lock objects stay alive after 5,000 transfers, so bounded state fails |
 
 What the patch does:
 

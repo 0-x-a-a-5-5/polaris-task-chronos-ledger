@@ -7,12 +7,12 @@
  import json
  import uuid
 -from typing import Dict, Optional
-+from contextlib import asynccontextmanager
-+from typing import Dict, FrozenSet, Iterable
++from contextlib import AsyncExitStack, asynccontextmanager
++from typing import Dict, FrozenSet, Iterable, Tuple
  from .models import (
      AccountNotFoundError,
      IdempotencyConflictError,
-@@ -12,85 +14,149 @@
+@@ -12,85 +14,153 @@ from .models import (
      TransferRequest,
  )
  
@@ -20,67 +20,84 @@
 +    "_HELD_ACCOUNT_LOCKS", default=frozenset()
 +)
 +
++
++class KeyedLockRegistry:
++    """
++    Hands out one asyncio.Lock per key while any coroutine is using that key and
++    forgets the key once the last user releases it. Memory therefore tracks
++    in-flight work, not the number of distinct keys the process has ever seen.
++    """
++
++    def __init__(self) -> None:
++        self._entries: Dict[str, Tuple[asyncio.Lock, int]] = {}
++
++    def __len__(self) -> int:
++        return len(self._entries)
++
++    @asynccontextmanager
++    async def acquire(self, key: str):
++        lock, refs = self._entries.get(key, (None, 0))
++        if lock is None:
++            lock = asyncio.Lock()
++        self._entries[key] = (lock, refs + 1)
++        try:
++            async with lock:
++                yield
++        finally:
++            lock, refs = self._entries[key]
++            if refs <= 1:
++                del self._entries[key]
++            else:
++                self._entries[key] = (lock, refs - 1)
++
++
++def shared_registry(db_pool, attr: str) -> KeyedLockRegistry:
++    """One registry per DB instance, so every engine, processor and worker on it agrees."""
++    registry = getattr(db_pool, attr, None)
++    if registry is None:
++        registry = KeyedLockRegistry()
++        setattr(db_pool, attr, registry)
++    return registry
++
  
  class LedgerEngine:
      """
 -    In-memory + SQLite WAL backed double-entry ledger engine.
 -    WARNING: Contains subtle concurrency defects for Polaris evaluation.
-+    Production-grade asynchronous double-entry ledger engine with:
-+    - Per-idempotency-key serialization and payload hash conflict detection
-+    - Fine-grained canonical per-account lock ordering (AB-BA deadlock free)
-+    - Coroutine-local lock reentrancy for multi-hop atomic batches
++    Asynchronous double-entry ledger engine with:
++    - per-idempotency-key serialization and payload-hash conflict detection
++    - canonical (sorted) per-account lock ordering, so AB-BA contention cannot deadlock
++    - coroutine-local lock reentrancy, so atomic batches can call execute_transfer
++    - reference-counted lock registries, so synchronization state stays bounded
      """
  
 -    def __init__(self, db_pool, simulated_io_delay_sec: float = 0.015):
 +    def __init__(self, db_pool, simulated_io_delay_sec: float = 0.015) -> None:
          self.db = db_pool
          self.io_delay = simulated_io_delay_sec
++        self._account_locks = shared_registry(db_pool, "_chronos_account_locks")
++        self._idempotency_locks = shared_registry(db_pool, "_chronos_idempotency_locks")
  
-+        if not hasattr(self.db, "_chronos_acct_locks"):
-+            setattr(self.db, "_chronos_acct_locks", {})
-+        if not hasattr(self.db, "_chronos_idemp_locks"):
-+            setattr(self.db, "_chronos_idemp_locks", {})
-+
-+    def _get_account_lock(self, account_id: str) -> asyncio.Lock:
-+        locks: Dict[str, asyncio.Lock] = getattr(self.db, "_chronos_acct_locks")
-+        if account_id not in locks:
-+            locks[account_id] = asyncio.Lock()
-+        return locks[account_id]
-+
-+    def _get_idempotency_lock(self, idempotency_key: str) -> asyncio.Lock:
-+        locks: Dict[str, asyncio.Lock] = getattr(self.db, "_chronos_idemp_locks")
-+        if idempotency_key not in locks:
-+            locks[idempotency_key] = asyncio.Lock()
-+        return locks[idempotency_key]
-+
-+    @asynccontextmanager
-+    async def acquire_canonical_account_locks(self, account_ids: Iterable[str]):
-+        currently_held = _HELD_ACCOUNT_LOCKS.get()
-+        needed = sorted(set(account_ids) - currently_held)
-+        acquired = []
-+        try:
-+            for acct_id in needed:
-+                lock = self._get_account_lock(acct_id)
-+                await lock.acquire()
-+                acquired.append(lock)
-+            token = _HELD_ACCOUNT_LOCKS.set(currently_held | set(needed))
-+            try:
-+                yield
-+            finally:
-+                _HELD_ACCOUNT_LOCKS.reset(token)
-+        finally:
-+            for lock in reversed(acquired):
-+                lock.release()
-+
-     async def execute_transfer(self, req: TransferRequest) -> TransferReceipt:
+-    async def execute_transfer(self, req: TransferRequest) -> TransferReceipt:
 -        if req.amount_cents <= 0:
 -            raise InvalidAmountError("Transfer amount must be positive integer cents.")
 -        if req.source_account == req.target_account:
 -            raise InvalidAmountError("Source and target accounts must differ.")
--
-+        self.validate_transfer_params(
-+            req.source_account, req.target_account, req.amount_cents
-+        )
++    @asynccontextmanager
++    async def acquire_canonical_account_locks(self, account_ids: Iterable[str]):
++        currently_held = _HELD_ACCOUNT_LOCKS.get()
++        needed = sorted(set(account_ids) - currently_held)
++        async with AsyncExitStack() as stack:
++            for acct_id in needed:
++                await stack.enter_async_context(self._account_locks.acquire(acct_id))
++            token = _HELD_ACCOUNT_LOCKS.set(currently_held | frozenset(needed))
++            try:
++                yield
++            finally:
++                _HELD_ACCOUNT_LOCKS.reset(token)
+ 
++    async def execute_transfer(self, req: TransferRequest) -> TransferReceipt:
++        self.validate_transfer_params(req.source_account, req.target_account, req.amount_cents)
          payload_hash = self._hash_request(req)
  
 -        existing = await self.db.fetch_idempotency_record(req.idempotency_key)
@@ -93,60 +110,25 @@
 -                amount_cents=existing["amount_cents"],
 -                status="COMMITTED",
 -            )
-+        idemp_lock = self._get_idempotency_lock(req.idempotency_key)
-+        async with idemp_lock:
-+            existing = await self.db.fetch_idempotency_record(req.idempotency_key)
-+            if existing is not None:
-+                if existing["payload_hash"] != payload_hash:
-+                    raise IdempotencyConflictError(
-+                        f"Idempotency key '{req.idempotency_key}' reused with mutated payload."
-+                    )
-+                return TransferReceipt(
-+                    transfer_id=existing["transfer_id"],
-+                    idempotency_key=req.idempotency_key,
-+                    source_account=req.source_account,
-+                    target_account=req.target_account,
-+                    amount_cents=existing["amount_cents"],
-+                    status="COMMITTED",
-+                )
- 
+-
 -        await asyncio.sleep(self.io_delay)
-+            async with self.acquire_canonical_account_locks(
-+                (req.source_account, req.target_account)
-+            ):
-+                await asyncio.sleep(self.io_delay)
- 
+-
 -        source_bal = await self.db.get_balance(req.source_account)
 -        target_bal = await self.db.get_balance(req.target_account)
-+                source_bal = await self.db.get_balance(req.source_account)
-+                target_bal = await self.db.get_balance(req.target_account)
- 
+-
 -        if source_bal is None or target_bal is None:
 -            raise AccountNotFoundError("One or both accounts do not exist.")
-+                if source_bal is None or target_bal is None:
-+                    raise AccountNotFoundError("One or both accounts do not exist.")
- 
+-
 -        if source_bal < req.amount_cents:
 -            raise InsufficientFundsError(
 -                f"Account {req.source_account} has {source_bal}, needs {req.amount_cents}"
 -            )
-+                if source_bal < req.amount_cents:
-+                    raise InsufficientFundsError(
-+                        f"Account {req.source_account} has {source_bal}, needs {req.amount_cents}"
-+                    )
- 
+-
 -        transfer_id = str(uuid.uuid4())
-+                transfer_id = str(uuid.uuid4())
- 
+-
 -        await self.db.update_balance(req.source_account, source_bal - req.amount_cents)
 -        await self.db.update_balance(req.target_account, target_bal + req.amount_cents)
-+                await self.db.update_balance(
-+                    req.source_account, source_bal - req.amount_cents
-+                )
-+                await self.db.update_balance(
-+                    req.target_account, target_bal + req.amount_cents
-+                )
- 
+-
 -        await self.db.insert_ledger_entries(
 -            transfer_id=transfer_id,
 -            source=req.source_account,
@@ -169,6 +151,46 @@
 -            transfer_id=transfer_id,
 -            amount_cents=req.amount_cents,
 -        )
+-
+-        return TransferReceipt(
+-            transfer_id=transfer_id,
+-            idempotency_key=req.idempotency_key,
+-            source_account=req.source_account,
+-            target_account=req.target_account,
+-            amount_cents=req.amount_cents,
+-            status="COMMITTED",
+-        )
++        async with self._idempotency_locks.acquire(req.idempotency_key):
++            existing = await self.db.fetch_idempotency_record(req.idempotency_key)
++            if existing is not None:
++                if existing["payload_hash"] != payload_hash:
++                    raise IdempotencyConflictError(
++                        f"Idempotency key '{req.idempotency_key}' reused with a different payload."
++                    )
++                return TransferReceipt(
++                    transfer_id=existing["transfer_id"],
++                    idempotency_key=req.idempotency_key,
++                    source_account=req.source_account,
++                    target_account=req.target_account,
++                    amount_cents=existing["amount_cents"],
++                    status="COMMITTED",
++                )
++
++            async with self.acquire_canonical_account_locks([req.source_account, req.target_account]):
++                await asyncio.sleep(self.io_delay)
++
++                source_bal = await self.db.get_balance(req.source_account)
++                target_bal = await self.db.get_balance(req.target_account)
++                if source_bal is None or target_bal is None:
++                    raise AccountNotFoundError("One or both accounts do not exist.")
++                if source_bal < req.amount_cents:
++                    raise InsufficientFundsError(
++                        f"Account {req.source_account} has {source_bal}, needs {req.amount_cents}"
++                    )
++
++                transfer_id = str(uuid.uuid4())
++                await self.db.update_balance(req.source_account, source_bal - req.amount_cents)
++                await self.db.update_balance(req.target_account, target_bal + req.amount_cents)
 +                await self.db.insert_ledger_entries(
 +                    transfer_id=transfer_id,
 +                    source=req.source_account,
@@ -193,15 +215,7 @@
 +                    transfer_id=transfer_id,
 +                    amount_cents=req.amount_cents,
 +                )
- 
--        return TransferReceipt(
--            transfer_id=transfer_id,
--            idempotency_key=req.idempotency_key,
--            source_account=req.source_account,
--            target_account=req.target_account,
--            amount_cents=req.amount_cents,
--            status="COMMITTED",
--        )
++
 +                return TransferReceipt(
 +                    transfer_id=transfer_id,
 +                    idempotency_key=req.idempotency_key,
@@ -212,9 +226,7 @@
 +                )
 +
 +    @staticmethod
-+    def validate_transfer_params(
-+        source_account: str, target_account: str, amount_cents: int
-+    ) -> None:
++    def validate_transfer_params(source_account: str, target_account: str, amount_cents: int) -> None:
 +        if amount_cents <= 0:
 +            raise InvalidAmountError("Transfer amount must be positive integer cents.")
 +        if source_account == target_account:
@@ -222,50 +234,145 @@
  
      @staticmethod
      def _hash_request(req: TransferRequest) -> str:
-
+--- a/workspace/src/chronos/db.py
++++ b/workspace/src/chronos/db.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import sqlite3
++import time
+ import uuid
+ from typing import Any, Dict, List, Optional
+ 
+@@ -47,7 +48,8 @@ class InMemoryAsyncLedgerDB:
+                 payload TEXT NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'PENDING',
+                 attempts INTEGER NOT NULL DEFAULT 0,
+-                last_error TEXT
++                last_error TEXT,
++                claimed_until REAL
+             );
+ 
+             CREATE TABLE batch_idempotency (
+@@ -156,10 +158,60 @@ class InMemoryAsyncLedgerDB:
+         )
+         return [dict(r) for r in cur.fetchall()]
+ 
++    async def claim_pending_outbox_events(
++        self, limit: int = 20, lease_sec: float = 30.0
++    ) -> List[Dict[str, Any]]:
++        """
++        Atomically claims up to `limit` events for `lease_sec` seconds.
++
++        Eligible rows are PENDING, or IN_FLIGHT with an expired lease (a worker
++        that claimed them hung or died). The SELECT and UPDATE run without
++        yielding to the event loop, so two workers can never claim the same row.
++        """
++        await asyncio.sleep(0)
++        now = time.monotonic()
++        cur = self._conn.execute(
++            """
++            SELECT event_id, aggregate_id, payload, status, attempts, last_error
++            FROM outbox_events
++            WHERE status = 'PENDING'
++               OR (status = 'IN_FLIGHT' AND claimed_until IS NOT NULL AND claimed_until < ?)
++            ORDER BY seq ASC
++            LIMIT ?
++            """,
++            (now, limit),
++        )
++        rows = [dict(r) for r in cur.fetchall()]
++        if rows:
++            self._conn.executemany(
++                "UPDATE outbox_events SET status = 'IN_FLIGHT', claimed_until = ? WHERE event_id = ?",
++                [(now + lease_sec, r["event_id"]) for r in rows],
++            )
++        return rows
++
++    async def fetch_batch_record(self, batch_id: str) -> Optional[Dict[str, Any]]:
++        await asyncio.sleep(0)
++        cur = self._conn.execute(
++            "SELECT batch_id, payload_hash, result_json FROM batch_idempotency WHERE batch_id = ?",
++            (batch_id,),
++        )
++        row = cur.fetchone()
++        return dict(row) if row is not None else None
++
++    async def save_batch_record(self, batch_id: str, payload_hash: str, result_json: str) -> None:
++        await asyncio.sleep(0)
++        self._conn.execute(
++            """
++            INSERT OR REPLACE INTO batch_idempotency (batch_id, payload_hash, result_json)
++            VALUES (?, ?, ?)
++            """,
++            (batch_id, payload_hash, result_json),
++        )
++
+     async def mark_outbox_status(self, event_id: str, status: str) -> None:
+         await asyncio.sleep(0)
+         self._conn.execute(
+-            "UPDATE outbox_events SET status = ? WHERE event_id = ?",
++            "UPDATE outbox_events SET status = ?, claimed_until = NULL WHERE event_id = ?",
+             (status, event_id),
+         )
+ 
+@@ -170,7 +222,7 @@ class InMemoryAsyncLedgerDB:
+         self._conn.execute(
+             """
+             UPDATE outbox_events
+-            SET status = ?, attempts = ?, last_error = ?
++            SET status = ?, attempts = ?, last_error = ?, claimed_until = NULL
+             WHERE event_id = ?
+             """,
+             (status, attempts, last_error, event_id),
 --- a/workspace/src/chronos/outbox.py
 +++ b/workspace/src/chronos/outbox.py
-@@ -1,30 +1,56 @@
-+import asyncio
-+from typing import Any, Dict, List
+@@ -1,30 +1,54 @@
++from .config import (
++    DEFAULT_OUTBOX_BATCH_SIZE,
++    DEFAULT_OUTBOX_CLAIM_LEASE_SEC,
++    DEFAULT_OUTBOX_MAX_ATTEMPTS,
++)
  from .models import PermanentWebhookError, TransientWebhookError
  
  
  class OutboxRelayWorker:
 -    def __init__(self, db_pool, transport, max_attempts: int = 3, batch_size: int = 20):
++    """
++    Relays outbox events to a webhook transport. Each tick atomically claims a
++    batch under a lease, so concurrent workers never dispatch the same event and
++    a worker that hangs or dies releases its claims when the lease expires.
++    """
++
 +    def __init__(
-+        self, db_pool, transport, max_attempts: int = 3, batch_size: int = 20
++        self,
++        db_pool,
++        transport,
++        max_attempts: int = DEFAULT_OUTBOX_MAX_ATTEMPTS,
++        batch_size: int = DEFAULT_OUTBOX_BATCH_SIZE,
++        claim_lease_sec: float = DEFAULT_OUTBOX_CLAIM_LEASE_SEC,
 +    ) -> None:
          self.db = db_pool
          self.transport = transport
          self.max_attempts = max_attempts
          self.batch_size = batch_size
++        self.claim_lease_sec = claim_lease_sec
  
-+        if not hasattr(self.db, "_chronos_outbox_claim_lock"):
-+            setattr(self.db, "_chronos_outbox_claim_lock", asyncio.Lock())
-+
-+    async def _claim_pending_batch(self) -> List[Dict[str, Any]]:
-+        claim_lock: asyncio.Lock = getattr(self.db, "_chronos_outbox_claim_lock")
-+        async with claim_lock:
-+            events = await self.db.fetch_pending_outbox_events(limit=self.batch_size)
-+            for ev in events:
-+                await self.db.mark_outbox_status(ev["event_id"], "IN_FLIGHT")
-+            return events
-+
      async def run_tick(self) -> int:
 -        """
 -        Polls pending events and dispatches them to the webhook transport.
 -        Returns the number of successfully dispatched events.
 -        """
 -        events = await self.db.fetch_pending_outbox_events(limit=self.batch_size)
-+        claimed_events = await self._claim_pending_batch()
++        """Claims pending (or lease-expired) events and dispatches them; returns the dispatched count."""
++        claimed = await self.db.claim_pending_outbox_events(
++            limit=self.batch_size, lease_sec=self.claim_lease_sec
++        )
          dispatched = 0
  
 -        for ev in events:
-+        for ev in claimed_events:
++        for ev in claimed:
 +            event_id = ev["event_id"]
 +            attempts = int(ev["attempts"]) + 1
-+
              try:
 -                await self.transport.send(ev["event_id"], ev["payload"])
 -                await self.db.mark_outbox_status(ev["event_id"], "DISPATCHED")
@@ -274,42 +381,34 @@
                  dispatched += 1
 +            except PermanentWebhookError as exc:
 +                await self.db.update_outbox_retry(
-+                    event_id,
-+                    status="DEAD_LETTER",
-+                    attempts=attempts,
-+                    last_error=str(exc),
++                    event_id, status="DEAD_LETTER", attempts=attempts, last_error=str(exc)
 +                )
              except TransientWebhookError as exc:
 -                attempts = ev["attempts"] + 1
--                new_status = "DEAD_LETTER" if attempts >= self.max_attempts else "PENDING"
+                 new_status = "DEAD_LETTER" if attempts >= self.max_attempts else "PENDING"
 -                await self.db.update_outbox_Direct(
 -                    ev["event_id"], status=new_status, attempts=attempts, last_error=str(exc)
-+                new_status = (
-+                    "DEAD_LETTER" if attempts >= self.max_attempts else "PENDING"
-                 )
 +                await self.db.update_outbox_retry(
-+                    event_id,
-+                    status=new_status,
-+                    attempts=attempts,
-+                    last_error=str(exc),
-+                )
++                    event_id, status=new_status, attempts=attempts, last_error=str(exc)
+                 )
 +
          return dispatched
-
 --- a/workspace/src/chronos/batch.py
 +++ b/workspace/src/chronos/batch.py
-@@ -1,32 +1,165 @@
+@@ -1,32 +1,123 @@
 -from typing import List
 -from .models import BatchResult, TransferReceipt, TransferRequest, TransferSpec
-+import asyncio
 +import hashlib
 +import json
-+from typing import Dict, List, Optional
++from typing import Dict, List
++from .config import MAX_BATCH_LEGS
++from .engine import shared_registry
 +from .models import (
 +    AccountNotFoundError,
 +    BatchResult,
 +    IdempotencyConflictError,
 +    InsufficientFundsError,
++    InvalidAmountError,
 +    TransferReceipt,
 +    TransferRequest,
 +    TransferSpec,
@@ -317,38 +416,48 @@
  
  
  class BatchTransferProcessor:
--    """
+     """
 -    Processes multi-hop transfer batches.
 -    WARNING: Starter implementation is non-atomic and lacks deadlock prevention
 -    and batch-level idempotency.
--    """
--
++    All-or-nothing multi-hop batches. Solvency of every leg is proven against
++    simulated running balances under canonical account locks before any leg is
++    committed, so a failing leg leaves no balance change, ledger entry or outbox
++    event behind. Results are persisted per batch_id so replays return the
++    identical BatchResult and mutated replays raise IdempotencyConflictError.
+     """
+ 
      def __init__(self, engine) -> None:
          self.engine = engine
 +        self.db = engine.db
++        self._batch_locks = shared_registry(self.db, "_chronos_batch_locks")
+ 
+-    async def execute_batch(
+-        self, batch_id: str, transfers: List[TransferSpec]
+-    ) -> BatchResult:
+-        if not transfers:
+-            return BatchResult(batch_id=batch_id, status="COMMITTED", receipts=[])
+-
+-        receipts: List[TransferReceipt] = []
+-        for idx, spec in enumerate(transfers):
+-            leg_req = TransferRequest(
+-                idempotency_key=f"{batch_id}:leg:{idx}",
+-                source_account=spec.source_account,
+-                target_account=spec.target_account,
+-                amount_cents=spec.amount_cents,
+-            )
+-            receipt = await self.engine.execute_transfer(leg_req)
+-            receipts.append(receipt)
+-
+-        return BatchResult(batch_id=batch_id, status="COMMITTED", receipts=receipts)
++    @staticmethod
++    def _hash_batch(transfers: List[TransferSpec]) -> str:
++        canonical = "|".join(f"{t.source_account}:{t.target_account}:{t.amount_cents}" for t in transfers)
++        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 +
-+        if not hasattr(self.db, "_chronos_batch_locks"):
-+            setattr(self.db, "_chronos_batch_locks", {})
-+        if not hasattr(self.db, "_chronos_batch_records"):
-+            setattr(self.db, "_chronos_batch_records", {})
-+
-+    def _get_batch_lock(self, batch_id: str) -> asyncio.Lock:
-+        locks: Dict[str, asyncio.Lock] = getattr(self.db, "_chronos_batch_locks")
-+        if batch_id not in locks:
-+            locks[batch_id] = asyncio.Lock()
-+        return locks[batch_id]
-+
-+    async def _fetch_batch_record(self, batch_id: str) -> Optional[Dict[str, str]]:
-+        await asyncio.sleep(0)
-+        records: Dict[str, Dict[str, str]] = getattr(self.db, "_chronos_batch_records")
-+        return records.get(batch_id)
-+
-+    async def _save_batch_record(
-+        self, batch_id: str, payload_hash: str, result: BatchResult
-+    ) -> None:
-+        await asyncio.sleep(0)
-+        records: Dict[str, Dict[str, str]] = getattr(self.db, "_chronos_batch_records")
-+        serialized = json.dumps(
++    @staticmethod
++    def _serialize(result: BatchResult) -> str:
++        return json.dumps(
 +            {
 +                "batch_id": result.batch_id,
 +                "status": result.status,
@@ -365,131 +474,79 @@
 +                ],
 +            }
 +        )
-+        records[batch_id] = {
-+            "payload_hash": payload_hash,
-+            "result_json": serialized,
-+        }
 +
 +    @staticmethod
-+    def _deserialize_batch_result(result_json: str) -> BatchResult:
++    def _deserialize(result_json: str) -> BatchResult:
 +        data = json.loads(result_json)
-+        receipts = [TransferReceipt(**r) for r in data["receipts"]]
 +        return BatchResult(
 +            batch_id=data["batch_id"],
 +            status=data["status"],
-+            receipts=receipts,
++            receipts=[TransferReceipt(**r) for r in data["receipts"]],
 +        )
 +
-+    @staticmethod
-+    def _hash_batch(transfers: List[TransferSpec]) -> str:
-+        canonical = "|".join(
-+            f"{t.source_account}:{t.target_account}:{t.amount_cents}"
-+            for t in transfers
-+        )
-+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
- 
-     async def execute_batch(
-         self, batch_id: str, transfers: List[TransferSpec]
-     ) -> BatchResult:
--        if not transfers:
--            return BatchResult(batch_id=batch_id, status="COMMITTED", receipts=[])
++    async def execute_batch(self, batch_id: str, transfers: List[TransferSpec]) -> BatchResult:
++        if len(transfers) > MAX_BATCH_LEGS:
++            raise InvalidAmountError(f"Batch exceeds the maximum of {MAX_BATCH_LEGS} legs.")
 +        for spec in transfers:
-+            self.engine.validate_transfer_params(
-+                spec.source_account, spec.target_account, spec.amount_cents
-+            )
- 
--        receipts: List[TransferReceipt] = []
--        for idx, spec in enumerate(transfers):
--            leg_req = TransferRequest(
--                idempotency_key=f"{batch_id}:leg:{idx}",
--                source_account=spec.source_account,
--                target_account=spec.target_account,
--                amount_cents=spec.amount_cents,
--            )
--            receipt = await self.engine.execute_transfer(leg_req)
--            receipts.append(receipt)
++            self.engine.validate_transfer_params(spec.source_account, spec.target_account, spec.amount_cents)
 +        payload_hash = self._hash_batch(transfers)
-+        batch_lock = self._get_batch_lock(batch_id)
- 
--        return BatchResult(batch_id=batch_id, status="COMMITTED", receipts=receipts)
-+        async with batch_lock:
-+            existing_batch = await self._fetch_batch_record(batch_id)
-+            if existing_batch is not None:
-+                if existing_batch["payload_hash"] != payload_hash:
-+                    raise IdempotencyConflictError(
-+                        f"Batch ID '{batch_id}' reused with different transfer legs."
-+                    )
-+                return self._deserialize_batch_result(existing_batch["result_json"])
++
++        async with self._batch_locks.acquire(batch_id):
++            existing = await self.db.fetch_batch_record(batch_id)
++            if existing is not None:
++                if existing["payload_hash"] != payload_hash:
++                    raise IdempotencyConflictError(f"Batch '{batch_id}' reused with different transfer legs.")
++                return self._deserialize(existing["result_json"])
 +
 +            if not transfers:
-+                empty_res = BatchResult(
-+                    batch_id=batch_id, status="COMMITTED", receipts=[]
-+                )
-+                await self._save_batch_record(batch_id, payload_hash, empty_res)
-+                return empty_res
++                empty = BatchResult(batch_id=batch_id, status="COMMITTED", receipts=[])
++                await self.db.save_batch_record(batch_id, payload_hash, self._serialize(empty))
++                return empty
 +
-+            all_accounts = {
-+                acct
-+                for spec in transfers
-+                for acct in (spec.source_account, spec.target_account)
-+            }
-+
++            all_accounts = {acct for spec in transfers for acct in (spec.source_account, spec.target_account)}
 +            async with self.engine.acquire_canonical_account_locks(all_accounts):
-+                simulated_balances: Dict[str, int] = {}
++                simulated: Dict[str, int] = {}
 +                for acct_id in sorted(all_accounts):
-+                    bal = await self.db.get_balance(acct_id)
-+                    if bal is None:
-+                        raise AccountNotFoundError(
-+                            f"Account '{acct_id}' does not exist."
-+                        )
-+                    simulated_balances[acct_id] = bal
++                    balance = await self.db.get_balance(acct_id)
++                    if balance is None:
++                        raise AccountNotFoundError(f"Account '{acct_id}' does not exist.")
++                    simulated[acct_id] = balance
 +
 +                for idx, spec in enumerate(transfers):
-+                    leg_key = f"{batch_id}:leg:{idx}"
 +                    leg_req = TransferRequest(
-+                        idempotency_key=leg_key,
-+                        source_account=spec.source_account,
-+                        target_account=spec.target_account,
-+                        amount_cents=spec.amount_cents,
++                        f"{batch_id}:leg:{idx}", spec.source_account, spec.target_account, spec.amount_cents
 +                    )
-+                    existing_leg = await self.db.fetch_idempotency_record(leg_key)
-+                    if existing_leg is not None:
-+                        expected_hash = self.engine._hash_request(leg_req)
-+                        if existing_leg["payload_hash"] != expected_hash:
-+                            raise IdempotencyConflictError(
-+                                f"Batch leg key '{leg_key}' conflicts with existing record."
-+                            )
-+
-+                    if simulated_balances[spec.source_account] < spec.amount_cents:
-+                        raise InsufficientFundsError(
-+                            f"Batch '{batch_id}' leg {idx} failed: account "
-+                            f"'{spec.source_account}' has {simulated_balances[spec.source_account]}, "
-+                            f"needs {spec.amount_cents}."
++                    existing_leg = await self.db.fetch_idempotency_record(leg_req.idempotency_key)
++                    if existing_leg is not None and existing_leg["payload_hash"] != self.engine._hash_request(leg_req):
++                        raise IdempotencyConflictError(
++                            f"Batch leg key '{leg_req.idempotency_key}' conflicts with an existing record."
 +                        )
-+                    simulated_balances[spec.source_account] -= spec.amount_cents
-+                    simulated_balances[spec.target_account] += spec.amount_cents
++                    if simulated[spec.source_account] < spec.amount_cents:
++                        raise InsufficientFundsError(
++                            f"Batch '{batch_id}' leg {idx}: account '{spec.source_account}' has "
++                            f"{simulated[spec.source_account]}, needs {spec.amount_cents}."
++                        )
++                    simulated[spec.source_account] -= spec.amount_cents
++                    simulated[spec.target_account] += spec.amount_cents
 +
 +                receipts: List[TransferReceipt] = []
 +                for idx, spec in enumerate(transfers):
-+                    leg_req = TransferRequest(
-+                        idempotency_key=f"{batch_id}:leg:{idx}",
-+                        source_account=spec.source_account,
-+                        target_account=spec.target_account,
-+                        amount_cents=spec.amount_cents,
++                    receipts.append(
++                        await self.engine.execute_transfer(
++                            TransferRequest(
++                                f"{batch_id}:leg:{idx}", spec.source_account, spec.target_account, spec.amount_cents
++                            )
++                        )
 +                    )
-+                    receipt = await self.engine.execute_transfer(leg_req)
-+                    receipts.append(receipt)
 +
-+                result = BatchResult(
-+                    batch_id=batch_id, status="COMMITTED", receipts=receipts
-+                )
-+                await self._save_batch_record(batch_id, payload_hash, result)
++                result = BatchResult(batch_id=batch_id, status="COMMITTED", receipts=receipts)
++                await self.db.save_batch_record(batch_id, payload_hash, self._serialize(result))
 +                return result
-
 --- a/workspace/tests/test_reproduction.py
 +++ b/workspace/tests/test_reproduction.py
-@@ -1,21 +1,149 @@
+@@ -1,21 +1,177 @@
 +import asyncio
++import contextlib
 +import json
  import unittest
 +from chronos.batch import BatchTransferProcessor
@@ -504,8 +561,14 @@
 +    TransientWebhookError,
 +)
 +from chronos.outbox import OutboxRelayWorker
-+
-+
+ 
+ 
+-class TestIncidentReproduction(unittest.IsolatedAsyncioTestCase):
+-    """
+-    Polaris Task Requirement:
+-    Replace these placeholders with deterministic async tests that FAIL on the
+-    unpatched codebase and PASS after your remediation.
+-    """
 +class ReproductionWebhookTransport:
 +    def __init__(self, poison_event_ids: set, transient_fail_once_ids: set):
 +        self.poison_event_ids = poison_event_ids
@@ -520,22 +583,16 @@
 +            self.transient_fail_once_ids.remove(event_id)
 +            raise TransientWebhookError(f"Transient 503 timeout for {event_id}")
 +        self.dispatched_events.append((event_id, json.loads(payload)))
++
  
- 
- class TestIncidentReproduction(unittest.IsolatedAsyncioTestCase):
--    """
--    Polaris Task Requirement:
--    Replace these placeholders with deterministic async tests that FAIL on the
--    unpatched codebase and PASS after your remediation.
--    """
-+    async def test_concurrent_idempotency_retry_storm(self):
++class TestIncidentReproduction(unittest.IsolatedAsyncioTestCase):
+     async def test_concurrent_idempotency_retry_storm(self):
+-        self.fail("TODO: Implement fail-to-pass concurrent retry storm reproduction.")
 +        db = await InMemoryAsyncLedgerDB.create_with_accounts(
 +            {"merchant_a": 10_000, "merchant_b": 0}
 +        )
 +        engine = LedgerEngine(db, simulated_io_delay_sec=0.01)
- 
--    async def test_concurrent_idempotency_retry_storm(self):
--        self.fail("TODO: Implement fail-to-pass concurrent retry storm reproduction.")
++
 +        req = TransferRequest(
 +            idempotency_key="retry_storm_key_01",
 +            source_account="merchant_a",
@@ -644,6 +701,33 @@
 +        self.assertEqual(await db.get_balance("acct_b"), 3_500)
 +        self.assertEqual(await db.get_balance("acct_c"), 1_000)
 +        self.assertEqual(await db.verify_double_entry_conservation(), 0)
++
++    async def test_outbox_claim_lease_recovers_hung_worker(self):
++        db = await InMemoryAsyncLedgerDB.create_with_accounts({})
++        for i in range(3):
++            await db.insert_outbox_event(f"lease_evt_{i}", "agg_lease", "{}")
++
++        class HangingTransport:
++            async def send(self, event_id: str, payload: str) -> None:
++                await asyncio.Event().wait()
++
++        recorder = ReproductionWebhookTransport(poison_event_ids=set(), transient_fail_once_ids=set())
++        hung_worker = OutboxRelayWorker(db, HangingTransport(), claim_lease_sec=0.05)
++        healthy_worker = OutboxRelayWorker(db, recorder, claim_lease_sec=0.05)
++
++        hung_task = asyncio.create_task(hung_worker.run_tick())
++        try:
++            await asyncio.sleep(0.01)
++            self.assertEqual(await healthy_worker.run_tick(), 0)  # claims still leased
++            await asyncio.sleep(0.1)
++            self.assertEqual(await healthy_worker.run_tick(), 3)  # leases expired
++        finally:
++            hung_task.cancel()
++            with contextlib.suppress(asyncio.CancelledError):
++                await hung_task
++
++        dispatched_ids = [ev_id for ev_id, _ in recorder.dispatched_events]
++        self.assertEqual(sorted(dispatched_ids), [f"lease_evt_{i}" for i in range(3)])
  
  
  if __name__ == "__main__":

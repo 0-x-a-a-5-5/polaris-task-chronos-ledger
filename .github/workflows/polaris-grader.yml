@@ -15,11 +15,11 @@ jobs:
       - name: Build Air-Gapped Polaris Container
         run: docker build -t polaris-chronos-eval .
 
-      - name: Verify Unpatched Baseline Score (0.425)
+      - name: Verify Unpatched Baseline Score (0.10)
         run: |
           OUTPUT=$(docker run --rm polaris-chronos-eval)
           echo "$OUTPUT"
-          echo "$OUTPUT" | grep -q '"final_score": 0.425,'
+          echo "$OUTPUT" | grep -q '"final_score": 0.1,'
 
       - name: Verify Reference Solution Score (1.00)
         run: |

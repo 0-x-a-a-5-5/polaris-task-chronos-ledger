@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import unittest
 from chronos.batch import BatchTransferProcessor
@@ -144,6 +145,33 @@ class TestIncidentReproduction(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await db.get_balance("acct_b"), 3_500)
         self.assertEqual(await db.get_balance("acct_c"), 1_000)
         self.assertEqual(await db.verify_double_entry_conservation(), 0)
+
+    async def test_outbox_claim_lease_recovers_hung_worker(self):
+        db = await InMemoryAsyncLedgerDB.create_with_accounts({})
+        for i in range(3):
+            await db.insert_outbox_event(f"lease_evt_{i}", "agg_lease", "{}")
+
+        class HangingTransport:
+            async def send(self, event_id: str, payload: str) -> None:
+                await asyncio.Event().wait()
+
+        recorder = ReproductionWebhookTransport(poison_event_ids=set(), transient_fail_once_ids=set())
+        hung_worker = OutboxRelayWorker(db, HangingTransport(), claim_lease_sec=0.05)
+        healthy_worker = OutboxRelayWorker(db, recorder, claim_lease_sec=0.05)
+
+        hung_task = asyncio.create_task(hung_worker.run_tick())
+        try:
+            await asyncio.sleep(0.01)
+            self.assertEqual(await healthy_worker.run_tick(), 0)  # claims still leased
+            await asyncio.sleep(0.1)
+            self.assertEqual(await healthy_worker.run_tick(), 3)  # leases expired
+        finally:
+            hung_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await hung_task
+
+        dispatched_ids = [ev_id for ev_id, _ in recorder.dispatched_events]
+        self.assertEqual(sorted(dispatched_ids), [f"lease_evt_{i}" for i in range(3)])
 
 
 if __name__ == "__main__":
