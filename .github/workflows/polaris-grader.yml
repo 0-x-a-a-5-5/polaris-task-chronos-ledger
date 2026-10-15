@@ -1,0 +1,29 @@
+name: Polaris Grader Verification
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  verify-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Air-Gapped Polaris Container
+        run: docker build -t polaris-chronos-eval .
+
+      - name: Verify Unpatched Baseline Score (0.425)
+        run: |
+          OUTPUT=$(docker run --rm polaris-chronos-eval)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q '"final_score": 0.425,'
+
+      - name: Verify Reference Solution Score (1.00)
+        run: |
+          OUTPUT=$(docker run --rm -v "${{ github.workspace }}/solutions:/eval/solutions:ro" polaris-chronos-eval \
+            sh -c "python3 /eval/solutions/apply_reference.py && python3 /eval/eval_harness/grader.py")
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q '"final_score": 1.0,'

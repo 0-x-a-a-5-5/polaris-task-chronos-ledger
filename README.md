@@ -1,9 +1,10 @@
 # POLARIS-SWE-042: Chronos High-Concurrency Ledger & Transactional Outbox Benchmark
 
+[![Polaris Grader Verification](https://github.com/0-x-a-a-5-5/polaris-task-chronos-ledger/actions/workflows/polaris-grader.yml/badge.svg)](https://github.com/0-x-a-a-5-5/polaris-task-chronos-ledger/actions/workflows/polaris-grader.yml)
 [![Polaris Task Spec](https://img.shields.io/badge/Polaris_Eval_Spec-v1.0-blue.svg)](#1-benchmark-overview--design-philosophy)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/External_Dependencies-Zero-success.svg)](#2-architecture--trust-boundary)
-[![Baseline Score](https://img.shields.io/badge/Unpatched_Baseline-0.15%20%2F%201.00-orange.svg)](#4-quickstart--docker-execution)
+[![Baseline Score](https://img.shields.io/badge/Unpatched_Baseline-0.425%20%2F%201.00-orange.svg)](#4-quickstart--docker-execution)
 [![Reference Patch](https://img.shields.io/badge/Reference_Solution-1.00%20%2F%201.00-brightgreen.svg)](#4-quickstart--docker-execution)
 
 **`POLARIS-SWE-042` (`chronos-ledger`)** is a hand-crafted, long-horizon software engineering evaluation task designed to measure an AI coding agent's ability to diagnose distributed systems race conditions, preserve double-entry financial invariants, and implement deadlock-free multi-hop batch transactions without degrading parallel throughput.
@@ -16,7 +17,7 @@ Standard coding benchmarks rely heavily on single-file algorithmic puzzles or hi
 
 `POLARIS-SWE-042` is engineered around four core **Polaris Evaluation Principles**:
 
-1. **Deceptive Baseline Health:** All public sequential tests (`tests/test_public_ledger.py`) pass out-of-the-box (`0.15 / 1.00` baseline score). The agent cannot rely on an immediate stack trace; it must reason about interleaved coroutine execution paths and read-modify-write hazards across `engine.py`, `outbox.py`, `batch.py`, and `db.py`.
+1. **Deceptive Baseline Health:** All public sequential tests (`tests/test_public_ledger.py`) pass out-of-the-box, and the unpatched baseline still scores `0.425 / 1.00`: it earns the public-suite credit, clears the throughput SLA trivially (nothing is locked yet), and finishes opposing batches without deadlocking for the same reason, while scoring `0.00` on every correctness dimension. The agent cannot rely on an immediate stack trace; it must reason about interleaved coroutine execution paths and read-modify-write hazards across `engine.py`, `outbox.py`, `batch.py`, and `db.py`.
 2. **Competing Functional & Non-Functional Constraints:** Fixing the idempotency and balance-drift race conditions by wrapping `LedgerEngine.execute_transfer()` in a coarse `asyncio.Lock()` satisfies basic correctness checks but violates the **Disjoint Account Throughput SLA** (100 concurrent transfers across disjoint account pairs with a 15ms I/O delay must complete in under `0.35s` for full credit).
 3. **Authentic Fail-to-Pass Diagnostic Verification:** The agent is required to author deterministic reproduction tests in `tests/test_reproduction.py`. During grading, the harness executes the agent's tests against an isolated snapshot of the **unpatched baseline codebase** first (requiring failure) and then against the **patched workspace** (requiring passage). Trivial `assert True` tests score `0.00`.
 4. **AST-Level Anti-Reward-Hacking Enforcement:** Before executing any behavioral test, `eval_harness/grader.py` verifies SHA-256 hashes of immutable files and parses the Python Abstract Syntax Tree (AST) of every module in `src/chronos/` to reject patches that delete `asyncio.sleep(self.io_delay)`, monkey-patch clock timers, hardcode harness tokens, or use silent `except Exception: pass` blocks.
@@ -83,7 +84,7 @@ The evaluation environment requires only Docker and runs completely offline in u
 docker build -t polaris-chronos-eval .
 ```
 
-### 1. Run the Grader on the Unpatched Baseline (Expected Score: `0.15`)
+### 1. Run the Grader on the Unpatched Baseline (Expected Score: `0.425`)
 ```bash
 docker run --rm polaris-chronos-eval
 ```
