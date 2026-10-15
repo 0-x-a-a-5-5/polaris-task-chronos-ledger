@@ -1,9 +1,9 @@
 # POLARIS-SWE-042: Chronos High-Concurrency Ledger & Transactional Outbox Benchmark
 
 > [!IMPORTANT]
-> **Live Eval Result (2026-10-15):** Gemini 3.8 Flash, running autonomously in Google's Antigravity CLI 1.3.6 on the verbatim `prompt.md`, scored **1.00 / 1.00** on rubric v1.0 after 13 min 47 s, 54 shell commands, and 18 file edits, with the integrity gate clean.
-> The same patch re-grades to **0.85** under rubric v1.1, hardened the same day: it has no claim-lease recovery, so a hung worker strands the events it claimed, and it keeps 15,051 lock objects alive after 5,000 transfers.
-> Diff, grader JSON under both rubrics, and run metadata are in [`trajectories/`](trajectories/).
+> **Live Eval Results (2026-10-15):** Gemini 3.8 Flash via Google's Antigravity CLI 1.3.6, running autonomously on the verbatim `prompt.md`. Rubric v1.0: **1.00 / 1.00** in 13 min 47 s. Rubric v1.1, hardened the same day: **1.00** at high effort in 10 min 22 s and **1.00** at low effort in 4 min 4 s, while the v1.0 patch re-grades to **0.85** under v1.1.
+> All three patches are genuine, not reward hacks: sorted per-account locks, atomic outbox claims, and pre-validated batch legs, with the v1.1 patches adding lease-expiring claims and reference-counted lock registries once the prompt asked for them.
+> Takeaway: at the current frontier this task measures specification-following under concurrency, not discovery. Diffs, grader JSON, and run metadata are in [`trajectories/`](trajectories/); section 6 logs the rubric iteration and what v1.2 has to change.
 
 [![Polaris Grader Verification](https://github.com/0-x-a-a-5-5/polaris-task-chronos-ledger/actions/workflows/polaris-grader.yml/badge.svg)](https://github.com/0-x-a-a-5-5/polaris-task-chronos-ledger/actions/workflows/polaris-grader.yml)
 [![Polaris Task Spec](https://img.shields.io/badge/Polaris_Eval_Spec-v1.1-blue.svg)](#1-benchmark-overview--design-philosophy)
@@ -126,3 +126,5 @@ The rubric is built to catch four failure archetypes that recur in agent traject
 | :--- | :--- | :--- | :--- |
 | v1.0 | 2026-10-14 | Six dimensions; weights summed to `1.15` and were capped at `1.00`. | Initial release. |
 | v1.1 | 2026-10-15 | Claim-lease recovery and bounded synchronization state added to `prompt.md` and the grader; throughput, bounded-state and deadlock credit gated on the correctness checks they depend on; batch idempotency, orphan-row and dead-letter checks; transient-backoff guard; per-run randomized identifiers; weights sum to `1.00`. | Attempt 01 saturated v1.0 in 14 minutes, and a no-op patch scored `0.425` because unlocked code is trivially fast and deadlock-free. The attempt-01 patch re-grades to `0.85` under v1.1. |
+| v1.1 result | 2026-10-15 | Two fresh attempts against the v1.1 prompt (high and low effort) both scored `1.00`, in 10 and 4 minutes. | Specified requirements are implemented reliably; the new checks only caught the patch written before they were specified. |
+| v1.2 (proposed) | | Multi-engine contention: two `LedgerEngine` instances over one database must still be exactly-once (attempt 03 would fail; attempt 02 passes). Crash consistency: kill the process mid-batch against a file-backed SQLite database and require a clean ledger on restart. Hot-account contention: throughput SLA with 100 transfers over 5 accounts. One requirement deliberately left implicit in the prompt, with the grader checking whether the agent discovers it from the incident data. | Move the measured skill from specification-following to discovery and failure-mode reasoning. |

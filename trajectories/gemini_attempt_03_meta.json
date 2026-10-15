@@ -1,0 +1,13 @@
+{
+  "attempt": 3,
+  "agent": "antigravity-cli 1.3.6",
+  "model": "gemini-3.8-flash-low",
+  "agent_python": "Python 3.11.17",
+  "started_utc": "2026-10-15T21:15:59Z",
+  "agent_wall_seconds": 251,
+  "agent_exit_code": 0,
+  "agent_timeout": "20m",
+  "prompt": "prompt.md (verbatim)",
+  "approval_mode": "dangerously-skip-permissions (all tool calls auto-approved)",
+  "grader": "docker polaris-chronos-eval, agent workspace mounted at /eval/workspace"
+}

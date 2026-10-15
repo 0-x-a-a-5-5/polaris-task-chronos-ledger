@@ -1,0 +1,58 @@
+{
+  "task_id": "POLARIS-SWE-042",
+  "rubric_version": "1.1",
+  "final_score": 1.0,
+  "integrity_passed": true,
+  "integrity_violations": [],
+  "rubric_breakdown": [
+    {
+      "dimension": "Public Regression Test Suite",
+      "weight": 0.1,
+      "raw_score": 1.0,
+      "weighted_contribution": 0.1,
+      "details": "Passed all public regression tests."
+    },
+    {
+      "dimension": "Diagnostic Fail-to-Pass Reproduction",
+      "weight": 0.15,
+      "raw_score": 1.0,
+      "weighted_contribution": 0.15,
+      "details": "Verified authentic Fail-to-Pass reproduction: failed on baseline, passed on patch."
+    },
+    {
+      "dimension": "Concurrency: 50-Way Idempotency & Conservation",
+      "weight": 0.2,
+      "raw_score": 1.0,
+      "weighted_contribution": 0.2,
+      "details": "Unique txns=1, balances=(7500, 2500), score=1.00"
+    },
+    {
+      "dimension": "Outbox: Poison-Pill Isolation, Atomic Claim & Lease Recovery",
+      "weight": 0.2,
+      "raw_score": 1.0,
+      "weighted_contribution": 0.2,
+      "details": "5 healthy events dispatched exactly once across 3 workers; poison pill dead-lettered with its error recorded; unexpired claim of a hung worker respected; expired claims re-dispatched exactly once after the lease; transient backoff verified"
+    },
+    {
+      "dimension": "Batch Processor: Atomic Rollback, Idempotency & AB-BA Deadlock Freedom",
+      "weight": 0.2,
+      "raw_score": 1.0,
+      "weighted_contribution": 0.2,
+      "details": "failed batch raised InsufficientFundsError and left balances untouched; no orphan ledger or outbox rows; batch replay (sequential and concurrent) idempotent; mutated replay raises IdempotencyConflictError; opposing batches completed without deadlock with correct final balances"
+    },
+    {
+      "dimension": "Non-Functional: Disjoint Account Parallel Throughput",
+      "weight": 0.1,
+      "raw_score": 1.0,
+      "weighted_contribution": 0.1,
+      "details": "100 disjoint transfers completed in 0.037s (SLA <= 0.35s for full credit)"
+    },
+    {
+      "dimension": "Non-Functional: Bounded Synchronization State",
+      "weight": 0.05,
+      "raw_score": 1.0,
+      "weighted_contribution": 0.05,
+      "details": "5000 transfers over 10000 accounts in 0.51s: retained objects +2351 (limit 5000), live asyncio sync primitives 0 (limit 512), conservation=ok"
+    }
+  ]
+}
